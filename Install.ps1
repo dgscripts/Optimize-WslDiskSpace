@@ -11,8 +11,12 @@
     If the execution policy would block the module, the installer offers to
     set it to RemoteSigned for the current user.
 
+    Run it from a terminal: "Run with PowerShell" in Explorer's context menu can
+    be blocked by the execution policy and closes the window before the result
+    can be read.
+
 .PARAMETER Uninstall
-    Removes the module again.
+    Removes the module again. The execution policy is left as it is.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\Install.ps1
@@ -25,33 +29,37 @@ param(
     [switch] $Uninstall
 )
 
-$ErrorActionPreference = 'Continue'
-
 #region Helpers
 
+function Get-PowerShell7Path {
+    param([string] $Edition = $PSVersionTable.PSEdition)
+
+    if ($Edition -eq 'Core') { return Join-Path $PSHOME 'pwsh.exe' }
+
+    $pwshCommand = Get-Command -Name 'pwsh.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pwshCommand) { return $pwshCommand.Source }
+
+    # E.g. an MSI installation without the PATH entry.
+    $defaultPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+    if (Test-Path -LiteralPath $defaultPath -PathType Leaf) { return $defaultPath }
+}
+
 function Get-PowerShellEdition {
-    # Both editions keep their user modules in separate folders under Documents
-    # (which may have been moved, e.g. into OneDrive).
-    $documentsPath = [Environment]::GetFolderPath('MyDocuments')
+    # Both editions keep their user modules in separate folders under Documents (which may have been
+    # moved, e.g. into OneDrive).
+    param([string] $DocumentsPath = [Environment]::GetFolderPath('MyDocuments'))
+
+    if (-not $DocumentsPath) { throw 'The Documents folder of this account could not be determined.' }
 
     [pscustomobject]@{
         Name           = 'Windows PowerShell'
         ExecutablePath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        ModulesPath    = Join-Path $documentsPath 'WindowsPowerShell\Modules'
+        ModulesPath    = Join-Path $DocumentsPath 'WindowsPowerShell\Modules'
     }
-
-    $powerShellCorePath = if ($PSVersionTable.PSEdition -eq 'Core') {
-        Join-Path $PSHOME 'pwsh.exe'
-    }
-    else {
-        (Get-Command -Name 'pwsh.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
-    }
-    if ($powerShellCorePath) {
-        [pscustomobject]@{
-            Name           = 'PowerShell 7'
-            ExecutablePath = $powerShellCorePath
-            ModulesPath    = Join-Path $documentsPath 'PowerShell\Modules'
-        }
+    [pscustomobject]@{
+        Name           = 'PowerShell 7'
+        ExecutablePath = Get-PowerShell7Path
+        ModulesPath    = Join-Path $DocumentsPath 'PowerShell\Modules'
     }
 }
 
@@ -80,22 +88,114 @@ function Invoke-EditionCommand {
     @($output | Where-Object { $_ -is [string] }) | Select-Object -Last 1
 }
 
+function Test-IsSourceCheckout {
+    # By content: a junction, mapped drive or UNC path hides that two paths lead to the same folder.
+    param([Parameter(Mandatory)] [string] $Path)
+
+    (Test-Path -LiteralPath (Join-Path $Path 'Install.ps1')) -or (Test-Path -LiteralPath (Join-Path $Path '.git'))
+}
+
+function Install-ModuleFolder {
+    # Removes the files of an older version, but not the folder: another process may use it as its
+    # working directory, and it may hold a checkout in a subfolder.
+    param(
+        [Parameter(Mandatory)] [string] $SourceDirectory,
+        [Parameter(Mandatory)] [string] $TargetDirectory,
+        [Parameter(Mandatory)] [string[]] $FileNames
+    )
+
+    $status = 'SourceCheckout'
+    if (-not (Test-IsSourceCheckout -Path $TargetDirectory)) {
+        if (Test-Path -LiteralPath $TargetDirectory) {
+            Get-ChildItem -LiteralPath $TargetDirectory -File -Force | Remove-Item -Force -ErrorAction Stop
+        }
+        $null = New-Item -ItemType Directory -Path $TargetDirectory -Force -ErrorAction Stop
+        foreach ($fileName in $FileNames) {
+            Copy-Item -LiteralPath (Join-Path $SourceDirectory $fileName) -Destination $TargetDirectory -ErrorAction Stop
+        }
+        $status = 'Installed'
+    }
+
+    # Downloaded files carry a "from the internet" mark, which RemoteSigned refuses to load.
+    Get-ChildItem -LiteralPath $TargetDirectory -File | Unblock-File -ErrorAction Stop
+    $status
+}
+
+function Uninstall-ModuleFolder {
+    param([Parameter(Mandatory)] [string] $TargetDirectory)
+
+    if (-not (Test-Path -LiteralPath $TargetDirectory)) { return 'NotInstalled' }
+    if (Test-IsSourceCheckout -Path $TargetDirectory) { return 'SourceCheckout' }
+
+    Get-ChildItem -LiteralPath $TargetDirectory -File -Force | Remove-Item -Force -ErrorAction Stop
+    if (-not (Get-ChildItem -LiteralPath $TargetDirectory -Force)) {
+        Remove-Item -LiteralPath $TargetDirectory -Force -ErrorAction SilentlyContinue
+    }
+    'Removed'
+}
+
+function Get-ExecutionPolicyBlock {
+    # A policy set by Group Policy overrides any change the user makes.
+    param([Parameter(Mandatory)] [pscustomobject] $Edition)
+
+    $policies = Invoke-EditionCommand -Edition $Edition -Command (
+        '@((Get-ExecutionPolicy -Scope MachinePolicy), (Get-ExecutionPolicy -Scope UserPolicy), (Get-ExecutionPolicy)) -join ''|''')
+    if (-not $policies) { return }
+
+    $machinePolicy, $userPolicy, $effectivePolicy = $policies -split '\|'
+    if (@('Restricted', 'AllSigned') -notcontains $effectivePolicy) { return }
+
+    [pscustomobject]@{
+        Policy        = $effectivePolicy
+        IsGroupPolicy = $machinePolicy -ne 'Undefined' -or $userPolicy -ne 'Undefined'
+    }
+}
+
+function Test-ModuleInstallation {
+    # By name, as a new terminal does: an import by path would also work outside PSModulePath.
+    param(
+        [Parameter(Mandatory)] [pscustomobject] $Edition,
+        [Parameter(Mandatory)] [string] $ModuleName,
+        [Parameter(Mandatory)] [string] $ModuleDirectory
+    )
+
+    $moduleBase = Invoke-EditionCommand -Edition $Edition -Command (
+        "try { Import-Module -Name $ModuleName -ErrorAction Stop; (Get-Module -Name $ModuleName | Select-Object -First 1).ModuleBase } " +
+        "catch { 'ERROR: ' + `$_.Exception.Message }")
+
+    if (-not $moduleBase) { return 'the check produced no output.' }
+    if ($moduleBase -like 'ERROR: *') { return "the module cannot be loaded. $($moduleBase.Substring(7))" }
+
+    $expectedDirectory = [System.IO.Path]::GetFullPath($ModuleDirectory).TrimEnd('\')
+    if ([string]::Equals($moduleBase.TrimEnd('\'), $expectedDirectory, [System.StringComparison]::OrdinalIgnoreCase)) { return }
+    "a new session loads the module from $moduleBase instead. Is $(Split-Path -Parent $ModuleDirectory) missing in PSModulePath?"
+}
+
 #endregion
 
 #region Main
 
+$ErrorActionPreference = 'Continue'
 $moduleName = 'WslDiskSpace'
 $moduleFileNames = @("$moduleName.psd1", "$moduleName.psm1")
 $editions = @(Get-PowerShellEdition)
+$hasFailures = $false
 
 if ($Uninstall) {
     foreach ($edition in $editions) {
         $moduleDirectory = Join-Path $edition.ModulesPath $moduleName
-        if (Test-Path -LiteralPath $moduleDirectory) {
-            Remove-Item -LiteralPath $moduleDirectory -Recurse -Force
-            Write-Host "Removed from $($edition.Name): $moduleDirectory"
+        try {
+            switch (Uninstall-ModuleFolder -TargetDirectory $moduleDirectory) {
+                'Removed' { Write-Host "Removed from $($edition.Name): $moduleDirectory" }
+                'SourceCheckout' { Write-Warning "$($edition.Name): $moduleDirectory is a checkout of the source and was not removed." }
+            }
+        }
+        catch {
+            Write-Warning "$($edition.Name): $moduleDirectory could not be removed. $($_.Exception.Message)"
+            $hasFailures = $true
         }
     }
+    if ($hasFailures) { exit 1 }
     return
 }
 
@@ -106,35 +206,42 @@ foreach ($moduleFileName in $moduleFileNames) {
 }
 
 Write-Host 'Installing the module' -ForegroundColor Cyan
-$sourceDirectory = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+$installedEditions = @()
 foreach ($edition in $editions) {
-    $moduleDirectory = Join-Path $edition.ModulesPath $moduleName
-    # When Install.ps1 is started from the installed module folder itself, the clean copy
-    # would delete its own source files.
-    $isSourceDirectory = [string]::Equals(
-        [System.IO.Path]::GetFullPath($moduleDirectory).TrimEnd([System.IO.Path]::DirectorySeparatorChar),
-        $sourceDirectory,
-        [System.StringComparison]::OrdinalIgnoreCase)
-
-    if (-not $isSourceDirectory) {
-        # A clean copy, so no files of an older version linger.
-        if (Test-Path -LiteralPath $moduleDirectory) {
-            Remove-Item -LiteralPath $moduleDirectory -Recurse -Force
-        }
-        $null = New-Item -ItemType Directory -Path $moduleDirectory -Force
-        foreach ($moduleFileName in $moduleFileNames) {
-            Copy-Item -LiteralPath (Join-Path $PSScriptRoot $moduleFileName) -Destination $moduleDirectory
-        }
+    if (-not $edition.ExecutablePath) {
+        Write-Host "  $($edition.Name): pwsh.exe not found, skipped"
+        continue
     }
-    # Downloaded files carry a "from the internet" mark, which RemoteSigned refuses to load.
-    Get-ChildItem -LiteralPath $moduleDirectory -File | Unblock-File
-    Write-Host "  $($edition.Name): $moduleDirectory"
+
+    $moduleDirectory = Join-Path $edition.ModulesPath $moduleName
+    try {
+        if ((Install-ModuleFolder -SourceDirectory $PSScriptRoot -TargetDirectory $moduleDirectory -FileNames $moduleFileNames) -eq 'Installed') {
+            Write-Host "  $($edition.Name): $moduleDirectory"
+        }
+        else {
+            Write-Host "  $($edition.Name): $moduleDirectory (a checkout of the source, left unchanged)"
+        }
+        $installedEditions += $edition
+    }
+    catch {
+        Write-Warning "$($edition.Name): the module could not be copied to $moduleDirectory. $($_.Exception.Message)"
+        $hasFailures = $true
+    }
 }
 
-$blockingPolicies = @('Restricted', 'AllSigned')
-$blockedEditions = @($editions | Where-Object {
-    $blockingPolicies -contains (Invoke-EditionCommand -Edition $_ -Command '(Get-ExecutionPolicy).ToString()')
-})
+$blockedEditions = @()
+foreach ($edition in $installedEditions) {
+    $policyBlock = Get-ExecutionPolicyBlock -Edition $edition
+    if (-not $policyBlock) { continue }
+
+    if ($policyBlock.IsGroupPolicy) {
+        Write-Warning ("Group Policy sets the execution policy of $($edition.Name) to $($policyBlock.Policy), " +
+            'which blocks this unsigned module there.')
+    }
+    else {
+        $blockedEditions += $edition
+    }
+}
 if ($blockedEditions.Count -gt 0) {
     Write-Host ''
     Write-Warning "The execution policy blocks locally installed modules in: $(($blockedEditions | ForEach-Object Name) -join ', ')."
@@ -148,22 +255,24 @@ if ($blockedEditions.Count -gt 0) {
 
 Write-Host ''
 Write-Host 'Checking the installation' -ForegroundColor Cyan
-foreach ($edition in $editions) {
-    $manifestPath = Join-Path (Join-Path $edition.ModulesPath $moduleName) "$moduleName.psd1"
-    $escapedManifestPath = $manifestPath -replace "'", "''"
-    $importResult = Invoke-EditionCommand -Edition $edition `
-        -Command "try { Import-Module -Name '$escapedManifestPath' -ErrorAction Stop; 'ready' } catch { `$_.Exception.Message }"
-
-    if ($importResult -eq 'ready') {
-        Write-Host "  $($edition.Name): ready" -ForegroundColor Green
+$readyCount = 0
+foreach ($edition in $installedEditions) {
+    $problem = Test-ModuleInstallation -Edition $edition -ModuleName $moduleName -ModuleDirectory (Join-Path $edition.ModulesPath $moduleName)
+    if ($problem) {
+        Write-Warning "$($edition.Name): $problem"
+        $hasFailures = $true
     }
     else {
-        Write-Warning "$($edition.Name): the module cannot be loaded. $importResult"
+        Write-Host "  $($edition.Name): ready" -ForegroundColor Green
+        $readyCount++
     }
 }
 
-Write-Host ''
-Write-Host 'Open a new terminal, type Optimize-Ws and press Tab.'
-Write-Host 'Use a normal terminal: the compaction asks for administrator rights itself.'
+if ($readyCount -gt 0) {
+    Write-Host ''
+    Write-Host 'Open a new terminal, type Optimize-Ws and press Tab.'
+    Write-Host 'Use a normal terminal: the compaction asks for administrator rights itself.'
+}
+if ($hasFailures) { exit 1 }
 
 #endregion

@@ -20,20 +20,20 @@ Total reclaimed: 55.41 GB
 ## What it does
 
 1. **Cleans up inside each distribution**, as root (through `wsl --user root`, so without a password prompt):
-   - `apt-get clean` and `apt-get autoremove`, where `apt-get` is available,
-   - `docker system prune --all --volumes`, where `docker` reaches a running daemon. It always uses the local daemon and ignores `DOCKER_HOST` and Docker contexts, so a remote Docker host is never pruned. With Docker Desktop's WSL integration, the local daemon is Docker Desktop's engine, so Docker Desktop's data is pruned too if Docker Desktop is running.
+   - `apt-get autoremove` and `apt-get clean`, where `apt-get` is available,
+   - `docker system prune --all` (with `--volumes` on Docker Engine 23.0 and later), where `docker` reaches a running daemon. It always uses the local daemon and ignores `DOCKER_HOST` and Docker contexts, so a remote Docker host is never pruned. With Docker Desktop's WSL integration, the local daemon is Docker Desktop's engine, so Docker Desktop's data is pruned too if Docker Desktop is running, once even if several distributions reach it.
 2. **Trims the file system** with `fstrim /`, so the blocks freed in step 1 are handed back to the virtual disk.
 3. **Stops Docker Desktop and shuts WSL down** (`wsl --shutdown`), which releases the virtual disks.
 4. **Compacts the virtual disks** of all distributions, including Docker Desktop's data disk, with `diskpart` and prints the summary shown above. This is usually the slowest step; diskpart shows its progress in percent.
 
-Docker Desktop's own distributions are left alone in steps 1 and 2; their disks are only compacted. Sparse, compressed or encrypted disks are not compacted, because `diskpart` cannot compact them; the summary lists them as `Skipped (unsupported)`.
+Docker Desktop's own distributions are left alone in steps 1 and 2; their disks are only compacted. Sparse, compressed, encrypted and fixed-size disks are not compacted, because `diskpart` cannot compact them; the summary lists them as `Skipped (unsupported)` or `Skipped (fixed size)`.
 
 Because the compaction uses `diskpart`, it doesn't need the Hyper-V module that `Optimize-VHD` requires, so it also works on Windows Home. Unlike `wsl --manage <name> --compact` in recent WSL versions, it also compacts Docker Desktop's data disk, which is not a registered distribution.
 
 ## Requirements
 
 - Windows 10 or 11 with WSL 2
-- Windows PowerShell 5.1 or PowerShell 7
+- Windows PowerShell 5.1 or PowerShell 7, 64-bit
 - Administrator rights for the compaction; the command asks for them itself (UAC)
 - Optional: Docker Desktop with the WSL 2 backend
 
@@ -57,9 +57,9 @@ This leaves the execution policy as it is. `Set-ExecutionPolicy -Scope CurrentUs
 
 ## Before you run it
 
-- **There is no dry run.** The only prompt comes before Docker data is pruned: it lists the distributions concerned, and if you decline, nothing is changed. If no Docker daemon is reachable, for example because Docker Desktop is not running, there is no prompt at all.
-- **`docker system prune --all --volumes` deletes Docker data:** all stopped containers, then every image, network and anonymous volume that no running container uses, and the build cache. Named volumes are kept, except with Docker Engine versions older than 23.0 (for example the `docker.io` package of Debian 12), which delete unused named volumes as well. Pruned images are downloaded or built again when you next need them. Use `-SkipDockerPrune` to keep all Docker data.
-- **WSL shuts down completely**, even with `-DistributionName`: every running distribution, open shell, VS Code remote session and container stops. Close VS Code windows and terminal tabs connected to WSL first, because they start their distribution again right away, and its disk can then not be compacted. Run the command in PowerShell on Windows, not in a WSL shell.
+- **There is no dry run.** The only prompt comes before Docker data is pruned: it lists the Docker engines concerned, and if you decline, nothing is changed. If no Docker daemon is reachable, for example because Docker Desktop is not running, there is no prompt at all.
+- **`docker system prune` deletes Docker data:** all stopped containers, then every image, network and anonymous volume that no running container uses, and the build cache. Named volumes are kept. Docker Engine versions older than 23.0 (for example the `docker.io` package of Debian 12) would delete them as well, so there the command does not prune volumes at all. Pruned images are downloaded or built again when you next need them. Use `-SkipDockerPrune` to keep all Docker data.
+- **WSL shuts down completely**, even with `-DistributionName`: every running distribution, open shell, VS Code remote session and container stops. Close VS Code windows and terminal tabs connected to WSL first: they start their distribution again right away, which can keep its disk from being compacted. Run the command in PowerShell on Windows, not in a WSL shell.
 - **Docker Desktop is stopped and not restarted.** Start it again when you need it.
 - **`apt-get autoremove` does not ask** before it removes packages that were installed as dependencies and are no longer needed. Use `-SkipPackageCleanup` to avoid it.
 
@@ -84,23 +84,25 @@ Optimize-WslDiskSpace -SkipPackageCleanup -SkipDockerPrune
 
 | Parameter | Effect |
 | --- | --- |
-| `-DistributionName` | Limits cleanup and compaction to these distributions. Tab completion lists the installed ones; Docker Desktop's data disk is called `docker-desktop-data`. |
-| `-SkipPackageCleanup` | Skips `apt-get clean` and `apt-get autoremove`. |
+| `-DistributionName` | Limits cleanup and compaction to these distributions. Tab completion lists the installed ones; Docker Desktop's data disk is called `docker-desktop-data`. An unknown name makes the command end with an error. |
+| `-SkipPackageCleanup` | Skips `apt-get autoremove` and `apt-get clean`. |
 | `-SkipDockerPrune` | Skips `docker system prune`. |
 | `-SkipCompaction` | Only cleans up inside the distributions: no `fstrim`, no WSL shutdown, no compaction. |
-| `-Force` | Skips the confirmation prompt before `docker system prune`. |
+| `-Force` | Skips the confirmation prompt before `docker system prune`. Without it, a run that gets no answer, e.g. under `-NonInteractive` or with input that ends first (`< NUL`), ends with an error. |
 
-`Get-Help Optimize-WslDiskSpace -Full` shows the complete help.
+Ctrl+C stops the command once the Linux command that is running has finished. Ctrl+C in the window where the compaction runs cancels it and detaches its disk. `Get-Help Optimize-WslDiskSpace -Full` shows the complete help.
 
 ### Administrator rights
 
 The cleanup needs no administrator rights. The compaction does, and the command asks for them itself. The UAC prompt appears after the cleanup, when WSL and Docker Desktop have already been stopped, so stay at the computer; if you decline it, nothing is compacted.
 
-- If Windows `sudo` is enabled in inline mode (Windows 11 24H2 and later: Settings > System > Advanced, or `sudo config --enable normal` in an elevated terminal), the compaction runs in the same window.
+- If Windows `sudo` is enabled in inline mode (Windows 11 24H2 and later: Settings > System > Advanced, or `sudo config --enable normal` in an elevated terminal) and your own account is an administrator, the compaction runs in the same window.
 - Otherwise it runs in a separate window, which closes when it is done and stays open if a disk failed.
 - In an elevated terminal, there is no UAC prompt.
 
 The summary is always shown in the window where you started the command.
+
+The elevated PowerShell loads the module from the folder it was imported from, for the installer's copy your per-user module folder, which programs running under your account can change. If the administrator is a separate account, it therefore runs code that your account can modify.
 
 ### Scheduled task
 
@@ -122,9 +124,17 @@ The task runs only while you are logged on. `New-ScheduledTaskTrigger` stores th
 ## Troubleshooting
 
 - **A distribution or Docker Desktop does not start after an interrupted run:** its disk is probably still attached. Run `Optimize-WslDiskSpace -DistributionName <name> -SkipPackageCleanup -SkipDockerPrune`; Docker Desktop's data disk is `docker-desktop-data`. The command detaches the disk before compacting it. For a distribution, this run warns that it could not be started and ends with an error; both are expected here.
-- **"The virtual disk is still in use":** something opened the `.vhdx` file again after the shutdown. Most often, a WSL client started the distribution again: VS Code connected to WSL, a terminal tab, or Explorer on `\\wsl.localhost`. Backup tools, antivirus scans and a restarted Docker Desktop can do the same. Close them and run the command again.
-- **"Path contains non-ASCII characters and has no 8.3 short name":** `diskpart` cannot handle paths with characters such as umlauts, so the command falls back to the 8.3 short path, which this volume does not provide. Move the disk to a path with ASCII characters only: a distribution with `wsl --manage <name> --move <path>`, Docker Desktop's disks with its "Disk image location" setting.
+- **"The virtual disk is still in use":** something opened the `.vhdx` file again, even after a second `wsl --shutdown`. Most often, a WSL client starts the distribution again: VS Code connected to WSL, a terminal tab, or Explorer on `\\wsl.localhost`. Backup tools, antivirus scans and a restarted Docker Desktop can do the same. Close them and run the command again.
+- **"Path contains non-ASCII characters and no 8.3 short name was found":** `diskpart` cannot handle paths with characters such as umlauts, so the command uses the 8.3 short names of such folders, which this volume does not provide. Move the disk to a path with ASCII characters only: a distribution with `wsl --manage <name> --move <path>`, Docker Desktop's disks with its "Disk image location" setting.
 - **"The 'Optimize-WslDiskSpace' command was found in the module 'WslDiskSpace', but the module could not be loaded":** usually the execution policy blocks the module; `Import-Module WslDiskSpace` shows the reason. Run the installer again and accept the offer to set `RemoteSigned`, or run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` in the PowerShell edition that is affected.
+
+## Tests
+
+```powershell
+Invoke-Pester -Path .\Tests
+```
+
+The tests need Pester 5.1 or later and never start WSL, diskpart or Docker. Tests tagged `WSL` additionally run shell commands in a distribution, with a fake `apt-get` and read-only `docker` calls, if `$env:WSLDISKSPACE_TEST_DISTRIBUTION` names one.
 
 ## License
 
