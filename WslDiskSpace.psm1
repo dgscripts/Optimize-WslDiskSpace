@@ -256,7 +256,8 @@ function Get-NativeCommandResult {
         [Parameter(Mandatory)] [string] $FilePath,
         [Parameter(Mandatory)] [string[]] $ArgumentList,
         [System.Text.Encoding] $OutputEncoding = [System.Text.UTF8Encoding]::new($false),
-        [int] $TimeoutSeconds = 0
+        [int] $TimeoutSeconds = 0,
+        [scriptblock] $StopWhen
     )
 
     $startInfo = New-NativeStartInfo -FilePath $FilePath -ArgumentList $ArgumentList -OutputEncoding $OutputEncoding
@@ -268,11 +269,12 @@ function Get-NativeCommandResult {
         $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         # Short waits, so Ctrl+C can stop this script in between.
         while (-not $process.WaitForExit(100)) {
-            if ($TimeoutSeconds -gt 0 -and $stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+            $isTimedOut = $TimeoutSeconds -gt 0 -and $stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds
+            if ($isTimedOut -or ($StopWhen -and (& $StopWhen))) {
                 try { $process.Kill() }
                 catch { <# It exited in the meantime. #> }
                 $process.WaitForExit()
-                return [pscustomobject]@{ ExitCode = $null; Output = ''; ErrorOutput = ''; TimedOut = $true }
+                return [pscustomobject]@{ ExitCode = $null; Output = ''; ErrorOutput = ''; TimedOut = $isTimedOut }
             }
         }
         $process.WaitForExit()
@@ -473,12 +475,15 @@ function Read-Confirmation {
     $answer -match '^(y|yes|j|ja)$'
 }
 
-function Stop-DockerDesktop {
-    $dockerDesktopProcessNames = @('Docker Desktop', 'com.docker.backend', 'com.docker.build')
+function Get-DockerDesktopProcess {
     # Only this Windows session: an elevated run must not stop Docker Desktop of other signed-in users.
     $currentSessionId = (Get-Process -Id $PID).SessionId
+    Get-Process -Name 'Docker Desktop', 'com.docker.backend', 'com.docker.build' -ErrorAction SilentlyContinue |
+        Where-Object SessionId -eq $currentSessionId
+}
 
-    if (-not (Get-Process -Name $dockerDesktopProcessNames -ErrorAction SilentlyContinue | Where-Object SessionId -eq $currentSessionId)) {
+function Stop-DockerDesktop {
+    if (-not (Get-DockerDesktopProcess)) {
         Write-Host '  Docker Desktop is not running.'
         return
     }
@@ -486,15 +491,16 @@ function Stop-DockerDesktop {
     $dockerCommand = Get-Command -Name 'docker.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($dockerCommand) {
         Write-Host '  Stopping Docker Desktop, this can take a minute...'
-        # Graceful shutdown, available since Docker Desktop 4.37. It has no time limit of its own.
-        $stopResult = Get-NativeCommandResult -FilePath $dockerCommand.Source -ArgumentList @('desktop', 'stop') -TimeoutSeconds 120
+        # Graceful shutdown, available since Docker Desktop 4.37. After Docker Desktop has exited, the command
+        # still waits for every other wsl.exe, e.g. of VS Code or a terminal, up to 5 minutes.
+        $stopResult = Get-NativeCommandResult -FilePath $dockerCommand.Source -ArgumentList @('desktop', 'stop') -TimeoutSeconds 120 -StopWhen {
+            -not (Get-DockerDesktopProcess)
+        }
         if ($stopResult.TimedOut) {
             Write-Warning 'docker desktop stop did not finish within 2 minutes, so Docker Desktop is stopped forcibly.'
         }
     }
-    Get-Process -Name $dockerDesktopProcessNames -ErrorAction SilentlyContinue |
-        Where-Object SessionId -eq $currentSessionId |
-        Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-DockerDesktopProcess | Stop-Process -Force -ErrorAction SilentlyContinue
     Write-Host '  Docker Desktop stopped. Start it again manually when needed.'
 }
 
@@ -774,8 +780,13 @@ function Optimize-VirtualDisk {
         # Recovers from an earlier run that was interrupted while the disk was attached.
         Dismount-VirtualDisk -VirtualDiskPath $VirtualDisk.Path
 
+        $isDockerDataDisk = $VirtualDisk.Name -eq $dockerDataDiskName
         $isUnlocked = Wait-FileUnlocked -FilePath $VirtualDisk.Path -TimeoutSeconds 10
-        if (-not $isUnlocked) {
+        if (-not $isUnlocked -and $isDockerDataDisk) {
+            # Only Docker Desktop holds this disk; a shutdown would stop distributions that are not compacted.
+            $isUnlocked = Wait-FileUnlocked -FilePath $VirtualDisk.Path
+        }
+        elseif (-not $isUnlocked) {
             # WSL clients such as VS Code start a distribution again right after the shutdown.
             Write-Host '  The virtual disk is in use, shutting WSL down once more.'
             $null = Get-NativeCommandResult -FilePath $wslPath -ArgumentList @('--shutdown')
@@ -783,8 +794,13 @@ function Optimize-VirtualDisk {
         }
 
         if (-not $isUnlocked) {
-            Write-Warning ('The virtual disk is still in use. Close VS Code windows, terminals and Explorer windows ' +
-                'connected to WSL, and run Optimize-WslDiskSpace again.')
+            $releaseHint = if ($isDockerDataDisk) {
+                "Quit Docker Desktop if it is running, or run 'wsl --shutdown', which stops all distributions,"
+            }
+            else {
+                'Close VS Code windows, terminals and Explorer windows connected to WSL,'
+            }
+            Write-Warning "The virtual disk is still in use. $releaseHint and run Optimize-WslDiskSpace again."
             $status = 'Skipped (in use)'
             $isFailure = $true
         }
@@ -961,16 +977,25 @@ function Invoke-CompactionWorker {
 function Invoke-CompactionPhase {
     param([Parameter(Mandatory)] [object[]] $VirtualDisks)
 
-    Write-Section 'Stopping Docker Desktop and WSL'
+    # Docker Desktop releases its data disk when it stops. The disk of a distribution stays attached to the
+    # WSL VM until WSL shuts down, also after 'wsl --terminate', and 'wsl --unmount' does not know it.
+    $needsWslShutdown = @($VirtualDisks | Where-Object Name -ne $dockerDataDiskName).Count -gt 0
+
+    Write-Section $(if ($needsWslShutdown) { 'Stopping Docker Desktop and WSL' } else { 'Stopping Docker Desktop' })
     Wait-DockerDesktopTrim
     Stop-DockerDesktop
-    $exitCode = Invoke-NativeCommand -FilePath $wslPath -ArgumentList @('--shutdown') -StandardOutputEncoding ([System.Text.UTF8Encoding]::new($false))
-    if ($exitCode -ne 0) {
-        Write-Warning "wsl --shutdown failed with exit code $exitCode, skipping compaction."
-        $script:hasFailures = $true
-        return
+    if ($needsWslShutdown) {
+        $exitCode = Invoke-NativeCommand -FilePath $wslPath -ArgumentList @('--shutdown') -StandardOutputEncoding ([System.Text.UTF8Encoding]::new($false))
+        if ($exitCode -ne 0) {
+            Write-Warning "wsl --shutdown failed with exit code $exitCode, skipping compaction."
+            $script:hasFailures = $true
+            return
+        }
+        Write-Host '  WSL has been shut down.'
     }
-    Write-Host '  WSL has been shut down.'
+    else {
+        Write-Host '  WSL keeps running: only Docker Desktop''s data disk is compacted.'
+    }
 
     $compactionResults = @(
         if (Test-IsAdministrator) {
@@ -1017,7 +1042,8 @@ function Optimize-WslDiskSpace {
              Engine 23.0 and later, which keeps named volumes.
           2. fstrim on the root file system, so freed blocks are handed back to
              the virtual disk and can actually be reclaimed by the compaction.
-          3. Stop Docker Desktop and shut down WSL, releasing all .vhdx files.
+          3. Stop Docker Desktop and shut down WSL, releasing all .vhdx files. If only
+             Docker Desktop's data disk is compacted, WSL keeps running.
           4. Compact the virtual disk of every distribution and Docker Desktop's data disk
              with diskpart and report how much space was reclaimed. Sparse, compressed,
              encrypted and fixed-size disks are skipped.
@@ -1063,7 +1089,9 @@ function Optimize-WslDiskSpace {
         - In a scheduled task, use "Run only when user is logged on", "Run with highest
           privileges" and -Force, because nobody can answer a UAC prompt or the confirmation.
           A standard user whose administrator is a different account cannot run it unattended.
-        - WSL is always shut down completely, even if only some disks are compacted.
+        - WSL is shut down completely, even if only some disks are compacted: the disk of a
+          distribution stays attached until WSL shuts down. Only -DistributionName
+          docker-desktop-data on its own keeps WSL running.
         - Docker Desktop is stopped but not restarted.
         - Ends with an error if any step failed, so a scheduled
           'pwsh -Command Optimize-WslDiskSpace -Force' exits with code 1.

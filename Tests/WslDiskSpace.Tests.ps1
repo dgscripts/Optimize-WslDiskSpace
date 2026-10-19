@@ -170,6 +170,19 @@ Describe 'native process helpers' {
         $result.ExitCode | Should -BeNullOrEmpty
     }
 
+    It 'stops a command as soon as its stop condition is met' {
+        $pingPath = Join-Path $env:SystemRoot 'System32\PING.EXE'
+        $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $result = InModuleScope WslDiskSpace -Parameters @{ PingPath = $pingPath } {
+            param($PingPath)
+            Get-NativeCommandResult -FilePath $PingPath -ArgumentList @('-n', '30', '127.0.0.1') -StopWhen { $true }
+        }
+
+        $stopwatch.Elapsed.TotalSeconds | Should -BeLessThan 10
+        $result.TimedOut | Should -BeFalse
+        $result.ExitCode | Should -BeNullOrEmpty
+    }
+
     It 'still reads the output of a command that it waits for after Ctrl+C' {
         # Regression: after Ctrl+C nobody read the output, so a talkative command blocked and the wait never ended.
         $tag = [guid]::NewGuid().ToString('N')
@@ -771,6 +784,41 @@ Describe 'Optimize-VirtualDisk' {
         Should -Invoke -ModuleName WslDiskSpace -CommandName Invoke-DiskpartCompaction -Times 0 -Exactly
     }
 
+    It 'waits longer for Docker Desktop to release its data disk instead of shutting WSL down' {
+        # Regression: compacting only docker-desktop-data shut WSL down and stopped the distributions in use.
+        $script:unlockAttempts = 0
+        Mock -ModuleName WslDiskSpace -CommandName Wait-FileUnlocked -MockWith {
+            $script:unlockAttempts++
+            $script:unlockAttempts -gt 1
+        }
+        $dataDisk = [pscustomobject]@{ Name = 'docker-desktop-data'; Path = 'C:\Fake\Docker\wsl\disk\docker_data.vhdx' }
+
+        $result = InModuleScope WslDiskSpace -Parameters @{ VirtualDisk = $dataDisk } {
+            param($VirtualDisk)
+            Optimize-VirtualDisk -VirtualDisk $VirtualDisk
+        }
+
+        $result.Status | Should -BeExactly 'Compacted'
+        Should -Invoke -ModuleName WslDiskSpace -CommandName Wait-FileUnlocked -Times 2 -Exactly
+        Should -Invoke -ModuleName WslDiskSpace -CommandName Get-NativeCommandResult -Times 0 -Exactly
+    }
+
+    It 'names Docker Desktop and wsl --shutdown when the data disk stays in use' {
+        Mock -ModuleName WslDiskSpace -CommandName Wait-FileUnlocked -MockWith { $false }
+        $dataDisk = [pscustomobject]@{ Name = 'docker-desktop-data'; Path = 'C:\Fake\Docker\wsl\disk\docker_data.vhdx' }
+
+        $result = InModuleScope WslDiskSpace -Parameters @{ VirtualDisk = $dataDisk } {
+            param($VirtualDisk)
+            Optimize-VirtualDisk -VirtualDisk $VirtualDisk
+        }
+
+        $result.Status | Should -BeExactly 'Skipped (in use)'
+        $result.IsFailure | Should -BeTrue
+        Should -Invoke -ModuleName WslDiskSpace -CommandName Write-Warning -Times 1 -Exactly -ParameterFilter {
+            $Message -like '*Docker Desktop*' -and $Message -like '*wsl --shutdown*'
+        }
+    }
+
     It 'skips a disk of fixed size without counting it as a failure' {
         # Regression: diskpart cannot compact fixed disks, so every run ended with an error.
         Mock -ModuleName WslDiskSpace -CommandName Wait-FileUnlocked -MockWith { $true }
@@ -858,6 +906,22 @@ Describe 'Stop-DockerDesktop' {
         Should -Invoke -ModuleName WslDiskSpace -CommandName Write-Warning -Times 1 -Exactly
         Should -Invoke -ModuleName WslDiskSpace -CommandName Stop-Process
     }
+
+    It 'stops waiting for docker desktop stop once Docker Desktop has exited' {
+        # Regression: 'docker desktop stop' also waits for every other wsl.exe, e.g. of VS Code, and ran into the time limit.
+        Mock -ModuleName WslDiskSpace -CommandName Get-NativeCommandResult -MockWith {
+            $script:stopCondition = $StopWhen
+            [pscustomobject]@{ ExitCode = $null; Output = ''; ErrorOutput = ''; TimedOut = $false }
+        }
+
+        InModuleScope WslDiskSpace { Stop-DockerDesktop }
+
+        $script:stopCondition | Should -Not -BeNullOrEmpty
+        (& $script:stopCondition) | Should -BeFalse
+        Mock -ModuleName WslDiskSpace -CommandName Get-Process -ParameterFilter { $Name } -MockWith { }
+        (& $script:stopCondition) | Should -BeTrue
+        Should -Invoke -ModuleName WslDiskSpace -CommandName Write-Warning -Times 0 -Exactly
+    }
 }
 
 Describe 'Wait-DockerDesktopTrim' {
@@ -930,6 +994,33 @@ Describe 'Invoke-CompactionPhase' {
         }
 
         @($script:calls) | Should -Be @('trim', 'stop')
+    }
+
+    It 'keeps WSL running when only Docker Desktop''s data disk is compacted' {
+        # Regression: compacting only docker-desktop-data shut WSL down and stopped the distributions in use.
+        $dataDisks = @([pscustomobject]@{ Name = 'docker-desktop-data'; Path = 'C:\Fake\Docker\wsl\disk\docker_data.vhdx' })
+
+        InModuleScope WslDiskSpace -Parameters @{ VirtualDisks = $dataDisks } {
+            param($VirtualDisks)
+            Invoke-CompactionPhase -VirtualDisks $VirtualDisks
+        }
+
+        Should -Invoke -ModuleName WslDiskSpace -CommandName Stop-DockerDesktop -Times 1 -Exactly
+        Should -Invoke -ModuleName WslDiskSpace -CommandName Invoke-NativeCommand -Times 0 -Exactly
+        Should -Invoke -ModuleName WslDiskSpace -CommandName Optimize-VirtualDisk -Times 1 -Exactly
+    }
+
+    It 'shuts WSL down when a distribution is compacted together with Docker Desktop''s data disk' {
+        $mixedDisks = $script:virtualDisks + [pscustomobject]@{ Name = 'docker-desktop-data'; Path = 'C:\Fake\Docker\wsl\disk\docker_data.vhdx' }
+
+        InModuleScope WslDiskSpace -Parameters @{ VirtualDisks = $mixedDisks } {
+            param($VirtualDisks)
+            Invoke-CompactionPhase -VirtualDisks $VirtualDisks
+        }
+
+        Should -Invoke -ModuleName WslDiskSpace -CommandName Invoke-NativeCommand -Times 1 -Exactly -ParameterFilter {
+            ($ArgumentList -join ' ') -eq '--shutdown'
+        }
     }
 }
 
