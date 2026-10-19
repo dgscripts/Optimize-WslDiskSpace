@@ -1,6 +1,6 @@
 @{
     RootModule           = 'WslDiskSpace.psm1'
-    ModuleVersion        = '1.1.0'
+    ModuleVersion        = '1.2.0'
     GUID                 = '50a48844-4b0a-4a26-86e7-ad69a1ad8363'
     Author               = 'Daniel Gross'
     Copyright            = '(c) 2026 Daniel Gross. Licensed under the MIT License.'

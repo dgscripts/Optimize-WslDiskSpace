@@ -45,9 +45,11 @@ cd Optimize-WslDiskSpace
 powershell -ExecutionPolicy Bypass -File .\Install.ps1
 ```
 
+Without git, download the source code ZIP of the [latest release](https://github.com/dgscripts/Optimize-WslDiskSpace/releases/latest), extract it and run the installer command in the extracted folder.
+
 The installer copies the module into your user module folder of Windows PowerShell (`Documents\WindowsPowerShell\Modules\WslDiskSpace`) and, if installed, PowerShell 7 (`Documents\PowerShell\Modules\WslDiskSpace`). Every new PowerShell session then has `Optimize-WslDiskSpace`, with tab completion for your distribution names. If the execution policy would block the module, the installer offers to set it to `RemoteSigned` for the current user. Run it from a terminal as shown: *Run with PowerShell* in Explorer's context menu can be blocked by the execution policy and closes the window before you can read the result.
 
-To update, run `git pull` and the installer again. To remove the module:
+To update, run `git pull` (or download the new release) and the installer again. To remove the module:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Install.ps1 -Uninstall
